@@ -57,6 +57,15 @@ type ClaudeLiveSession = {
   drainTimer: NodeJS.Timeout | null;
   drainingAbortedTurn: boolean;
   subagentMonitor: { stop: () => void } | null;
+  /** The cliSessionId that the current subagentMonitor is watching, or null if no monitor. */
+  subagentMonitorCliSessionId: string | null;
+  /** Context params needed to (re)start the subagent monitor with the correct session id. */
+  subagentMonitorContext: {
+    sessionId?: string;
+    sessionKey?: string;
+    runId?: string;
+    workspaceDir: string;
+  };
   idleTimer: NodeJS.Timeout | null;
   cleanup: () => Promise<void>;
   cleanupDone: boolean;
@@ -401,6 +410,33 @@ function closeLiveSession(
   cleanupLiveSession(session);
 }
 
+function swapSubagentMonitorIfNeeded(
+  session: ClaudeLiveSession,
+  newCliSessionId: string,
+  context: {
+    sessionId?: string;
+    sessionKey?: string;
+    runId?: string;
+    workspaceDir: string;
+  },
+): void {
+  if (session.subagentMonitorCliSessionId === newCliSessionId) {
+    return;
+  }
+  if (session.subagentMonitor) {
+    session.subagentMonitor.stop();
+    session.subagentMonitor = null;
+  }
+  session.subagentMonitorCliSessionId = newCliSessionId;
+  session.subagentMonitor = startClaudeSubagentActivityMonitor({
+    sessionId: context.sessionId,
+    sessionKey: context.sessionKey,
+    runId: context.runId,
+    workspaceDir: context.workspaceDir,
+    cliSessionId: newCliSessionId,
+  });
+}
+
 function scheduleIdleClose(session: ClaudeLiveSession): void {
   if (session.idleTimer) {
     clearTimeout(session.idleTimer);
@@ -575,7 +611,15 @@ function handleClaudeLiveLine(session: ClaudeLiveSession, line: string): void {
   }
   turn.rawLines.push(trimmed);
   turn.streamingParser.push(`${trimmed}\n`);
-  turn.sessionId = parseSessionId(parsed) ?? turn.sessionId;
+  const parsedSessionId = parseSessionId(parsed);
+  if (parsedSessionId && parsedSessionId !== turn.sessionId) {
+    turn.sessionId = parsedSessionId;
+    if (!session.closing) {
+      swapSubagentMonitorIfNeeded(session, parsedSessionId, session.subagentMonitorContext);
+    }
+  } else {
+    turn.sessionId = parsedSessionId ?? turn.sessionId;
+  }
   if (parsed.type !== "result") {
     return;
   }
@@ -765,6 +809,13 @@ async function createClaudeLiveSession(params: {
     drainTimer: null,
     drainingAbortedTurn: false,
     subagentMonitor,
+    subagentMonitorCliSessionId: liveCliSessionId ?? null,
+    subagentMonitorContext: {
+      sessionId: params.context.params.sessionId,
+      sessionKey: params.context.params.sessionKey,
+      runId: params.context.params.runId,
+      workspaceDir: params.context.workspaceDir,
+    },
     idleTimer: null,
     cleanup: params.cleanup,
     cleanupDone: false,

@@ -126,6 +126,80 @@ describe("startClaudeSubagentActivityMonitor", () => {
     }
   });
 
+  it("emits against the new directory after the monitor is swapped to the real session id", async () => {
+    // Simulate the gap fix: a fresh session starts a monitor with argv sid A,
+    // then JSONL stdout reveals the real sid B.  The live-session code stops
+    // the A monitor and starts a fresh B monitor.  Only B's directory should
+    // receive emit calls once the swap has happened.
+    const now = 1_000_000;
+    const workspaceDir = "/home/test/workspace";
+
+    const emitA = vi.fn();
+    const depsA = {
+      emit: emitA,
+      readDir: async (dir: string) => {
+        if (dir.includes("sid-argv")) {
+          return ["agent-a.jsonl"];
+        }
+        return [];
+      },
+      statFile: async () => ({ mtimeMs: now - 5_000 }),
+      now: () => now,
+    };
+    const monitorA = startClaudeSubagentActivityMonitor({
+      sessionId: "sess-1",
+      workspaceDir,
+      cliSessionId: "sid-argv",
+      intervalMs: 1_000,
+      freshnessMs: 30_000,
+      deps: depsA,
+    });
+
+    // Advance so A emits once while it is the active monitor.
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(emitA).toHaveBeenCalledTimes(1);
+
+    // Simulated swap: JSONL stdout gave us the real session id "sid-real".
+    monitorA.stop();
+
+    const emitB = vi.fn();
+    const depsB = {
+      emit: emitB,
+      readDir: async (dir: string) => {
+        if (dir.includes("sid-real")) {
+          return ["agent-b.jsonl"];
+        }
+        return [];
+      },
+      statFile: async () => ({ mtimeMs: now - 5_000 }),
+      now: () => now,
+    };
+    const monitorB = startClaudeSubagentActivityMonitor({
+      sessionId: "sess-1",
+      workspaceDir,
+      cliSessionId: "sid-real",
+      intervalMs: 1_000,
+      freshnessMs: 30_000,
+      deps: depsB,
+    });
+
+    try {
+      // Advance enough for B to fire once.
+      await vi.advanceTimersByTimeAsync(1_500);
+      // A is stopped, so emitA must not have gained any new calls.
+      expect(emitA).toHaveBeenCalledTimes(1);
+      // B should have emitted once, watching the sid-real directory.
+      expect(emitB).toHaveBeenCalledTimes(1);
+      expect(emitB).toHaveBeenCalledWith({
+        sessionId: "sess-1",
+        sessionKey: undefined,
+        runId: undefined,
+      });
+    } finally {
+      monitorB.stop();
+    }
+  });
+
   it("stops emitting after stop() is called", async () => {
     const now = 1_000_000;
     const deps = makeDeps({
